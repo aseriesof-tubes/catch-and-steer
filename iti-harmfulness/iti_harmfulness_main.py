@@ -45,7 +45,8 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import roc_auc_score, accuracy_score, classification_report
 
 # Setup logging to file
-LOG_FILE = Path("output.log")
+# Use a differently named log file to avoid permission/locking issues
+LOG_FILE = Path("run_output.log")
 def log(msg, also_print=True):
     """Log message to both file and stdout"""
     with open(LOG_FILE, "a") as f:
@@ -1009,10 +1010,9 @@ test_prompts = [
 ]
 
 generation_params = {
-    "max_new_tokens": 50,
-    "do_sample": True,
-    "top_p": 0.9,
-    "temperature": 0.8,
+    "max_new_tokens": 30,
+    # Deterministic generation for debugging (no sampling)
+    "do_sample": False,
     "pad_token_id": tokenizer.eos_token_id,
 }
 
