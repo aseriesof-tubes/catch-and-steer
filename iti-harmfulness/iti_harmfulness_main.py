@@ -29,6 +29,8 @@ import pickle
 import numpy as np
 import torch
 import joblib
+import sys
+import traceback
 from pathlib import Path
 from tqdm.auto import tqdm
 from typing import Dict, List, Tuple, Optional
@@ -41,6 +43,36 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import roc_auc_score, accuracy_score, classification_report
+
+# Setup logging to file
+LOG_FILE = Path("output.log")
+def log(msg, also_print=True):
+    """Log message to both file and stdout"""
+    with open(LOG_FILE, "a") as f:
+        f.write(msg + "\n")
+    if also_print:
+        print(msg)
+
+
+# Safe print helper to avoid UnicodeEncodeError on Windows consoles
+def safe_print(s: str) -> None:
+    try:
+        print(s)
+    except UnicodeEncodeError:
+        # Fallback: write UTF-8 bytes to stdout buffer
+        try:
+            sys.stdout.buffer.write(s.encode("utf-8", errors="replace") + b"\n")
+        except Exception:
+            # Last resort: replace problematic characters
+            print(s.encode("utf-8", errors="replace").decode("utf-8"))
+
+log("="*80)
+log("SCRIPT START")
+log("="*80)
+
+# NOTE: removed self-execution (exec of this file) which previously caused
+# recursive execution when the script was run. The script now proceeds
+# normally from here.
 
 
 # =============================================================================
@@ -55,13 +87,12 @@ OUTPUT_DIR = Path("./outputs")  # Where to store results and generated text
 # Dataset and data collection
 DATASET_NAME = "civil_comments"  # HuggingFace dataset for harmfulness detection
 DATASET_CONFIG = None  # No specific config for civil_comments
-DATA_SPLIT = "train[:5000]"  # Use first 5000 training examples (can adjust)
-VAL_SPLIT = "validation[:1000]"  # Use 1000 validation examples
-TEST_SPLIT = "test[:500]"  # Use 500 test examples (optional)
+DATA_SPLIT = "train[:50]"  # Use a small number for quick smoke tests
+VAL_SPLIT = "validation[:20]"  # Small validation set for smoke testing
+TEST_SPLIT = "test[:10]"  # Tiny test set
 
 # Tokenization
-MAX_LEN = 128  # Maximum sequence length (truncate/pad to this)
-BATCH_SIZE = 32  # Batch size for forward passes
+BATCH_SIZE = 8  # Small batch size for quick smoke tests
 
 # Probe training
 TRAIN_TEST_SPLIT = 0.8  # 80% train, 20% val within the data
@@ -69,7 +100,7 @@ PROBE_MAX_ITER = 2000  # Max iterations for logistic regression
 PROBE_CLASS_WEIGHT = "balanced"  # Handle class imbalance
 
 # Head selection
-TOP_K_HEADS = 32  # How many top heads to select based on validation accuracy
+TOP_K_HEADS = 8  # Select fewer heads for quick smoke tests
 
 # Steering parameters
 STEERING_ALPHA = 1.5  # Strength of steering in units of sigma
@@ -77,15 +108,15 @@ STEERING_CATCH_THRESHOLD = 0.6  # Confidence threshold for "Catch & Steer"
 
 # GPU/Device
 device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"[INIT] Using device: {device}")
+log(f"[INIT] Using device: {device}")
 
 
 # =============================================================================
 # SECTION 0: UTILITY FUNCTIONS
 # =============================================================================
-print("\n" + "="*80)
-print("SECTION 0: UTILITY FUNCTIONS")
-print("="*80)
+log("\n" + "="*80)
+log("SECTION 0: UTILITY FUNCTIONS")
+log("="*80)
 
 def ensure_dir(path: Path) -> None:
     """
@@ -149,7 +180,7 @@ def path_exists(filepath: Path) -> bool:
 # Ensure output directories exist
 ensure_dir(CACHE_DIR)
 ensure_dir(OUTPUT_DIR)
-print("[UTIL] Utility functions loaded.\n")
+log("[UTIL] Utility functions loaded.\n")
 
 
 # =============================================================================
@@ -163,21 +194,46 @@ print(f"\n>> Loading dataset: {DATASET_NAME}")
 print(f"   - Train split: {DATA_SPLIT}")
 print(f"   - Val split: {VAL_SPLIT}")
 
-# Load training data
-print("\n[DATA] Loading training dataset...")
-ds_train = load_dataset(DATASET_NAME, DATASET_CONFIG, split=DATA_SPLIT)
-texts_train = ds_train["text"]
-labels_train = np.array(ds_train["toxicity"], dtype=np.int32)  # Binary: 0=not toxic, 1=toxic
-print(f"   Train examples: {len(texts_train)}")
-print(f"   Label distribution: {np.bincount(labels_train)}")
+# Cache dataset to disk
+DATA_CACHE_TRAIN = CACHE_DIR / "dataset_train.pkl"
+DATA_CACHE_VAL = CACHE_DIR / "dataset_val.pkl"
+LABELS_CACHE_TRAIN = CACHE_DIR / "labels_train.npy"
+LABELS_CACHE_VAL = CACHE_DIR / "labels_val.npy"
 
-# Load validation data
-print("\n[DATA] Loading validation dataset...")
-ds_val = load_dataset(DATASET_NAME, DATASET_CONFIG, split=VAL_SPLIT)
-texts_val = ds_val["text"]
-labels_val = np.array(ds_val["toxicity"], dtype=np.int32)
-print(f"   Val examples: {len(texts_val)}")
-print(f"   Label distribution: {np.bincount(labels_val)}")
+
+#LOAD TRAIN AND VAL
+if path_exists(DATA_CACHE_TRAIN) and path_exists(DATA_CACHE_VAL):
+    print("\n>> Using cached dataset")
+    texts_train = load_pickle(DATA_CACHE_TRAIN)
+    texts_val = load_pickle(DATA_CACHE_VAL)
+    labels_train = load_numpy(LABELS_CACHE_TRAIN)
+    labels_val = load_numpy(LABELS_CACHE_VAL)
+    
+else:
+    print("\n>> Downloading fresh dataset (this may take a minute)...")
+    
+    # Load training data
+    print("\n[DATA] Loading training dataset...")
+    ds_train = load_dataset(DATASET_NAME, DATASET_CONFIG, split=DATA_SPLIT)
+    texts_train = ds_train["text"]
+    labels_train = np.array(ds_train["toxicity"], dtype=np.int32)  # Binary: 0=not toxic, 1=toxic
+    print(f"   Train examples: {len(texts_train)}")
+    print(f"   Label distribution: {np.bincount(labels_train)}")
+
+    # Load validation data
+    print("\n[DATA] Loading validation dataset...")
+    ds_val = load_dataset(DATASET_NAME, DATASET_CONFIG, split=VAL_SPLIT)
+    texts_val = ds_val["text"]
+    labels_val = np.array(ds_val["toxicity"], dtype=np.int32)
+    print(f"   Val examples: {len(texts_val)}")
+    print(f"   Label distribution: {np.bincount(labels_val)}")
+    
+    # Cache to disk for next run
+    save_pickle(texts_train, DATA_CACHE_TRAIN)
+    save_pickle(texts_val, DATA_CACHE_VAL)
+    save_numpy(labels_train, LABELS_CACHE_TRAIN)
+    save_numpy(labels_val, LABELS_CACHE_VAL)
+    print("\n[DATA] Dataset cached to disk for next run")
 
 # Store in dict for easy access
 data = {
@@ -186,6 +242,47 @@ data = {
     "texts_val": texts_val,
     "labels_val": labels_val,
 }
+
+# Attempt to load a small TEST split (if available) and print first examples
+DATA_CACHE_TEST = CACHE_DIR / "dataset_test.pkl"
+LABELS_CACHE_TEST = CACHE_DIR / "labels_test.npy"
+
+#LOAD TEST
+if path_exists(DATA_CACHE_TEST) and path_exists(LABELS_CACHE_TEST):
+    texts_test = load_pickle(DATA_CACHE_TEST)
+    labels_test = load_numpy(LABELS_CACHE_TEST)
+else:
+    try:
+        ds_test = load_dataset(DATASET_NAME, DATASET_CONFIG, split=TEST_SPLIT)
+        texts_test = ds_test["text"]
+        labels_test = np.array(ds_test["toxicity"], dtype=np.int32)
+        # Cache for future runs
+        save_pickle(texts_test, DATA_CACHE_TEST)
+        save_numpy(labels_test, LABELS_CACHE_TEST)
+    except Exception as e:
+        print(f"[DATA] Test split not available or failed to load: {e}")
+        texts_test = []
+        labels_test = np.array([], dtype=np.int32)
+
+data["texts_test"] = texts_test
+data["labels_test"] = labels_test
+
+def _print_samples(name, texts, labels, n=2):
+    print(f"\n[DEBUG] First {n} {name} samples (for debugging):")
+    for i in range(min(n, len(texts))):
+        # Use safe_print to avoid Windows console encoding issues
+        try:
+            safe_print(f"  #{i}: {texts[i]}")
+        except Exception:
+            print(f"  #{i}: <unprintable text>")
+        lbl = labels[i] if i < len(labels) else 'N/A'
+        print(f"    label: {lbl}")
+
+
+# Print first few samples for train/val/test to aid debugging
+_print_samples('train', texts_train, labels_train)
+_print_samples('val', texts_val, labels_val)
+_print_samples('test', texts_test, labels_test)
 
 print("\n[DATA] Dataset loaded successfully.\n")
 
@@ -268,77 +365,91 @@ else:
     @torch.no_grad()
     def collect_head_activations(texts, labels, batch_size=BATCH_SIZE):
         """
-        Collect per-head activations for all text examples.
-        
+        Collect per-head activations by capturing the attention-module outputs
+        via temporary forward hooks. This ensures activations come from the
+        same tensor that steering hooks will modify.
+
+        Only extracts the LAST TOKEN activation from each example.
+
         Returns:
-            activations_per_head: Dict[Tuple[layer, head]] -> np.ndarray (N, head_dim)
-            labels: np.ndarray (N,)
+            activations_per_head: Dict[layer][head] -> np.ndarray (N, head_dim)
         """
         num_layers = model.config.num_hidden_layers
         num_heads = model.config.num_attention_heads
         head_dim = model.config.hidden_size // num_heads
-        
-        # Initialize storage: activations_per_head[layer][head] = list of activations
+
+        # Storage for activations collected via hooks
         activations_per_head = {}
         for layer in range(num_layers):
             activations_per_head[layer] = {}
             for head in range(num_heads):
                 activations_per_head[layer][head] = []
-        
-        # Process in batches
+
+        # Hook callback factory: captures the attention module's output
+        # and appends per-head last-token activations to our storage.
+        hooks = []
+
+        def make_capture_hook(layer_idx):
+            def _hook(module, input, output):
+                # output may be tensor or tuple
+                if isinstance(output, tuple):
+                    attn_out = output[0]
+                else:
+                    attn_out = output
+
+                # attn_out: (batch_size, seq_len, hidden_size)
+                bsz, seq_len, hidden_size = attn_out.shape
+                # reshape to (batch, seq_len, num_heads, head_dim)
+                out_resh = attn_out.reshape(bsz, seq_len, num_heads, head_dim)
+                # take last token per example
+                last_token = out_resh[:, -1, :, :].cpu().numpy()  # shape: (bsz, num_heads, head_dim)
+
+                # Append per-head
+                for h in range(num_heads):
+                    activations_per_head[layer_idx][h].append(last_token[:, h, :])
+
+            return _hook
+
+        # Register hooks on each attention layer
+        for layer_idx in range(num_layers):
+            attn_layer = model.transformer.h[layer_idx].attn
+            hook_fn = make_capture_hook(layer_idx)
+            hooks.append(attn_layer.register_forward_hook(hook_fn))
+
+        # Process in batches and run forward passes (hooks collect activations)
         num_batches = (len(texts) + batch_size - 1) // batch_size
-        pbar = tqdm(total=num_batches, desc="Collecting activations")
-        
+        pbar = tqdm(total=num_batches, desc="Collecting activations (hooks)")
+
         for batch_idx in range(num_batches):
             start_idx = batch_idx * batch_size
             end_idx = min(start_idx + batch_size, len(texts))
-            batch_texts = texts[start_idx:end_idx]
-            
-            # Tokenize
-            enc = tokenizer(
-                batch_texts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=MAX_LEN
-            ).to(device)
-            
-            # Forward pass (no gradients)
-            with torch.no_grad():
-                out = model(**enc)
-            
-            # out.hidden_states is tuple of (batch, seq_len, hidden_size) for each layer
-            # We want the last token's activation for each head
-            
-            for layer_idx, hidden_state in enumerate(out.hidden_states[1:]):  # Skip input embeddings
-                # hidden_state shape: (batch_size, seq_len, hidden_size)
-                last_token_acts = hidden_state[:, -1, :]  # (batch_size, hidden_size)
-                
-                # Split into heads
-                # Reshape: (batch_size, num_heads, head_dim)
-                last_token_acts = last_token_acts.view(
-                    last_token_acts.size(0), 
-                    num_heads, 
-                    head_dim
-                )
-                
-                # Store per head
-                for head_idx in range(num_heads):
-                    head_acts = last_token_acts[:, head_idx, :].cpu().numpy()  # (batch_size, head_dim)
-                    activations_per_head[layer_idx][head_idx].append(head_acts)
-            
+            batch_texts = list(texts[start_idx:end_idx])
+
+            enc = tokenizer(batch_texts, return_tensors="pt", padding=True).to(device)
+            _ = model(**enc)
+
             pbar.update(1)
-        
+
         pbar.close()
-        
-        # Concatenate all batches for each head
-        print("   Concatenating batches...")
+
+        # Remove hooks
+        for h in hooks:
+            try:
+                h.remove()
+            except Exception:
+                pass
+
+        # Concatenate batches per head
+        print("   Concatenating batches (hook-collected)...")
         for layer in range(num_layers):
             for head in range(num_heads):
-                activations_per_head[layer][head] = np.concatenate(
-                    activations_per_head[layer][head], axis=0
-                )
-        
+                if len(activations_per_head[layer][head]) == 0:
+                    activations_per_head[layer][head] = np.zeros((0, head_dim), dtype=np.float32)
+                else:
+                    activations_per_head[layer][head] = np.concatenate(
+                        activations_per_head[layer][head], axis=0
+                    )
+
         return activations_per_head
     
     # Collect for train and val
@@ -410,6 +521,21 @@ else:
             y_train = labels_train
             y_val = labels_val
             
+            # If the training labels contain only one class (possible with
+            # very small or imbalanced subsets), skip training the probe for
+            # this head to avoid solver errors.
+            if np.unique(y_train).size < 2:
+                print(f"   [PROBE] SKIP Layer {layer_idx} Head {head_idx}: only one class present in training labels")
+                probes_metadata[str(layer_idx)][str(head_idx)] = {
+                    "layer": layer_idx,
+                    "head": head_idx,
+                    "train_acc": None,
+                    "val_acc": None,
+                    "val_auc": None,
+                    "skipped": True,
+                }
+                continue
+
             # Standardize using training statistics
             scaler = StandardScaler()
             X_train_scaled = scaler.fit_transform(X_train_head)
@@ -459,6 +585,58 @@ else:
 print("\n[PROBES] All probes trained/loaded.")
 print()
 
+# -----------------------------------------------------------------------------
+# DEBUG: Print per-head activations and probe predictions for a single example
+# Inserted here so it runs after probes are trained but before head selection
+# -----------------------------------------------------------------------------
+print("\n" + "="*40)
+print("[DEBUG] Per-head activations and probe predictions for first validation example")
+sample_idx = 0
+try:
+    sample_text = texts_val[sample_idx]
+    sample_label = labels_val[sample_idx]
+    safe_print(f"[DEBUG] VAL sample #{sample_idx}: {sample_text}")
+    print(f"[DEBUG] True label: {sample_label}")
+except Exception as e:
+    print(f"[DEBUG] Could not access validation sample: {e}")
+else:
+    num_layers = len(activations_val)
+    num_heads = len(activations_val[0])
+    for layer_idx in range(num_layers):
+        for head_idx in range(num_heads):
+            try:
+                x = activations_val[layer_idx][head_idx][sample_idx]  # (head_dim,)
+            except Exception as e:
+                print(f"Layer {layer_idx} Head {head_idx}: no activation for sample: {e}")
+                continue
+
+            norm = float(np.linalg.norm(x))
+            head_probe_dir = CACHE_DIR / f"probes" / f"layer_{layer_idx}" / f"head_{head_idx}"
+
+            # If probe files missing or probe was skipped, note and continue
+            if not path_exists(head_probe_dir / "clf.joblib") or not path_exists(head_probe_dir / "scaler_mean.npy"):
+                print(f"Layer {layer_idx} Head {head_idx}: probe missing or skipped | act_norm={norm:.4f}")
+                continue
+
+            # Load probe artifacts
+            try:
+                scaler_mean = np.load(head_probe_dir / "scaler_mean.npy")
+                scaler_scale = np.load(head_probe_dir / "scaler_scale.npy")
+                clf = joblib.load(head_probe_dir / "clf.joblib")
+
+                # Standardize and predict
+                x_scaled = (x - scaler_mean) / (scaler_scale + 1e-12)
+                proba = float(clf.predict_proba(x_scaled.reshape(1, -1))[0, 1])
+                pred = int(clf.predict(x_scaled.reshape(1, -1))[0])
+
+                print(f"Layer {layer_idx} Head {head_idx}: pred={pred} proba={proba:.4f} act_norm={norm:.4f}")
+                print(f"  activation (first 8 dims): {np.array2string(x[:8], precision=3, separator=', ')}")
+
+            except Exception as e:
+                print(f"Layer {layer_idx} Head {head_idx}: error evaluating probe: {e}")
+
+print("" + "="*40 + "\n")
+
 
 # =============================================================================
 # SECTION 5: SELECT TOP-K HEADS BY VALIDATION ACCURACY
@@ -492,13 +670,16 @@ else:
         for head_idx_str, metrics in heads_dict.items():
             layer_idx = int(layer_idx_str)
             head_idx = int(head_idx_str)
-            val_acc = metrics["val_acc"]
+            val_acc = metrics.get("val_acc", None)
+            if val_acc is None:
+                # Skip heads where probe training was skipped or unavailable
+                continue
             all_heads_ranked.append({
                 "layer": layer_idx,
                 "head": head_idx,
                 "val_acc": val_acc,
-                "val_auc": metrics["val_auc"],
-                "train_acc": metrics["train_acc"],
+                "val_auc": metrics.get("val_auc", None),
+                "train_acc": metrics.get("train_acc", None),
             })
     
     # Sort by validation accuracy (descending)
@@ -542,57 +723,80 @@ where alpha is a hyperparameter controlling steering strength.
 """
 
 STEERING_VECTORS_CACHE = CACHE_DIR / "steering_vectors.pkl"
-
 if path_exists(STEERING_VECTORS_CACHE):
     print("\n>> Using cached steering vectors")
     steering_vectors = load_pickle(STEERING_VECTORS_CACHE)
-    
 else:
-    print("\n>> Computing mean-shift vectors for selected heads")
-    
+    print("\n>> Computing mean-shift vectors for selected heads (safe mode)")
     steering_vectors = {}
-    
+
     for head_info in tqdm(selected_heads, desc="Computing theta, sigma"):
         layer_idx = head_info["layer"]
         head_idx = head_info["head"]
-        
+
         # Get training activations for this head
         X_head = activations_train[layer_idx][head_idx]  # (N, head_dim)
         y_train = labels_train
-        
+
+        # Basic sanity checks
+        if X_head.size == 0 or y_train.size == 0:
+            print(f"  [STEER] SKIP Layer {layer_idx} Head {head_idx}: empty activations or labels")
+            continue
+
         # Split by class
-        X_pos = X_head[y_train == 1]  # harmful examples
-        X_neg = X_head[y_train == 0]  # harmless examples
-        
+        X_pos = X_head[y_train == 1]
+        X_neg = X_head[y_train == 0]
+
+        if X_pos.size == 0 or X_neg.size == 0:
+            print(f"  [STEER] SKIP Layer {layer_idx} Head {head_idx}: one class missing in training data "
+                  f"(pos={X_pos.shape[0]}, neg={X_neg.shape[0]})")
+            continue
+
         # Compute class means
         mu_pos = np.mean(X_pos, axis=0)  # (head_dim,)
         mu_neg = np.mean(X_neg, axis=0)  # (head_dim,)
-        
+
         # Mean-shift direction
         theta_raw = mu_pos - mu_neg
-        theta = theta_raw / (np.linalg.norm(theta_raw) + 1e-12)  # Normalize
-        
+        raw_norm = np.linalg.norm(theta_raw)
+
+        if raw_norm < 1e-12:
+            print(f"  [STEER] SKIP Layer {layer_idx} Head {head_idx}: zero mean-shift vector")
+            continue
+
+        theta = theta_raw / (raw_norm + 1e-12)
+        theta_norm = float(np.linalg.norm(theta))
+
+        # Defensive: enforce unit norm
+        if abs(theta_norm - 1.0) > 1e-6:
+            theta = theta / (theta_norm + 1e-12)
+            theta_norm = float(np.linalg.norm(theta))
+
         # Compute sigma: std dev of scalar projections
         scalar_projs = np.dot(X_head, theta)  # (N,)
-        sigma = np.std(scalar_projs)
-        
-        # Store
+        sigma = float(np.std(scalar_projs))
+
+        # Store diagnostics and vectors
         head_key = (layer_idx, head_idx)
         steering_vectors[head_key] = {
-            "theta": theta.astype(np.float32),  # Normalized direction
-            "sigma": float(sigma),              # Std dev of projections
+            "theta": theta.astype(np.float32),
+            "theta_norm": theta_norm,
+            "sigma": sigma,
             "mu_pos": mu_pos.astype(np.float32),
             "mu_neg": mu_neg.astype(np.float32),
+            "n_pos": int(X_pos.shape[0]),
+            "n_neg": int(X_neg.shape[0]),
         }
-    
+
     # Save
     save_pickle(steering_vectors, STEERING_VECTORS_CACHE)
 
 print(f"\n[STEER] Computed steering vectors for {len(steering_vectors)} heads")
-for (layer_idx, head_idx), vec_data in list(steering_vectors.items())[:3]:
+for (layer_idx, head_idx), vec_data in list(steering_vectors.items()):
     print(f"   Layer {layer_idx}, Head {head_idx}: "
-          f"theta_norm={np.linalg.norm(vec_data['theta']):.4f}, "
-          f"sigma={vec_data['sigma']:.4f}")
+          f"theta_norm={vec_data.get('theta_norm', np.linalg.norm(vec_data['theta'])):.6f}, "
+          f"sigma={vec_data.get('sigma', 0.0):.6f}, "
+          f"n_pos={vec_data.get('n_pos', 'NA')}, n_neg={vec_data.get('n_neg', 'NA')}")
 
 print()
 
@@ -656,19 +860,30 @@ def make_unconditional_iti_hook(layer_idx, head_idx, theta, sigma, alpha=STEERIN
         2. Add steering to the target head
         3. Reshape back
         """
-        # output: (batch_size, seq_len, hidden_size)
-        batch_size, seq_len, hidden_size = output.shape
+        # The attention module may return a tensor or a tuple
+        if isinstance(output, tuple):
+            attn_output = output[0]
+            rest = output[1:]
+        else:
+            attn_output = output
+            rest = ()
+
+        # attn_output: (batch_size, seq_len, hidden_size)
+        batch_size, seq_len, hidden_size = attn_output.shape
         
         # Reshape to separate heads: (batch_size, seq_len, num_heads, head_dim)
-        output_reshaped = output.reshape(batch_size, seq_len, num_heads, head_dim)
+        output_reshaped = attn_output.reshape(batch_size, seq_len, num_heads, head_dim)
         
         # Add steering to target head (all tokens, all batch items)
         output_reshaped[:, :, head_idx, :] = output_reshaped[:, :, head_idx, :] + steer_vec
         
         # Reshape back: (batch_size, seq_len, hidden_size)
-        output = output_reshaped.reshape(batch_size, seq_len, hidden_size)
-        
-        return output
+        modified_attn = output_reshaped.reshape(batch_size, seq_len, hidden_size)
+
+        # Return same structure as input (tensor or tuple)
+        if rest:
+            return (modified_attn, *rest)
+        return modified_attn
     
     return hook
 
@@ -721,11 +936,19 @@ def make_conditional_catch_steer_hook(layer_idx, head_idx, theta, sigma,
         """
         Conditional hook: apply steering only when catch signal triggers.
         """
-        # output: (batch_size, seq_len, hidden_size)
-        batch_size, seq_len, hidden_size = output.shape
+        # The attention module may return a tensor or a tuple
+        if isinstance(output, tuple):
+            attn_output = output[0]
+            rest = output[1:]
+        else:
+            attn_output = output
+            rest = ()
+
+        # attn_output: (batch_size, seq_len, hidden_size)
+        batch_size, seq_len, hidden_size = attn_output.shape
         
         # Reshape to separate heads: (batch_size, seq_len, num_heads, head_dim)
-        output_reshaped = output.reshape(batch_size, seq_len, num_heads, head_dim)
+        output_reshaped = attn_output.reshape(batch_size, seq_len, num_heads, head_dim)
         
         # Get activations for target head at all tokens
         head_acts = output_reshaped[:, :, head_idx, :]  # (batch_size, seq_len, head_dim)
@@ -747,9 +970,11 @@ def make_conditional_catch_steer_hook(layer_idx, head_idx, theta, sigma,
         output_reshaped[:, :, head_idx, :] = output_reshaped[:, :, head_idx, :] + (steer_vec * catch_mask)
         
         # Reshape back
-        output = output_reshaped.reshape(batch_size, seq_len, hidden_size)
-        
-        return output
+        modified_attn = output_reshaped.reshape(batch_size, seq_len, hidden_size)
+
+        if rest:
+            return (modified_attn, *rest)
+        return modified_attn
     
     return hook
 
@@ -804,7 +1029,7 @@ for prompt_idx, prompt in enumerate(test_prompts, 1):
         enc = tokenizer(prompt, return_tensors="pt").to(device)
         gen = model.generate(**enc, **generation_params)
         baseline_text = tokenizer.decode(gen[0], skip_special_tokens=True)
-    print(baseline_text)
+    safe_print(baseline_text)
     
     # 2. UNCONDITIONAL ITI GENERATION
     print("\n[ITI] Unconditional ITI (always steer):")
@@ -830,7 +1055,7 @@ for prompt_idx, prompt in enumerate(test_prompts, 1):
             enc = tokenizer(prompt, return_tensors="pt").to(device)
             gen = model.generate(**enc, **generation_params)
             iti_text = tokenizer.decode(gen[0], skip_special_tokens=True)
-        print(iti_text)
+        safe_print(iti_text)
         
     finally:
         # Always remove hooks
@@ -871,7 +1096,7 @@ for prompt_idx, prompt in enumerate(test_prompts, 1):
     
     # Save outputs
     output_file = OUTPUT_DIR / f"generation_prompt_{prompt_idx}.txt"
-    with open(output_file, "w") as f:
+    with open(output_file, "w", encoding="utf-8") as f:
         f.write(f"PROMPT: {prompt}\n")
         f.write(f"\n{'='*80}\n")
         f.write(f"BASELINE:\n{baseline_text}\n")
@@ -921,7 +1146,7 @@ TO EXTEND:
 4. Combine with other safety techniques (constitutional AI, etc.)
 """)
 
-print("\n" + "="*80)
-print("SCRIPT COMPLETED SUCCESSFULLY")
-print("="*80)
-print()
+safe_print("\n" + "="*80)
+safe_print("SCRIPT COMPLETED SUCCESSFULLY")
+safe_print("="*80)
+safe_print("")
