@@ -1,27 +1,3 @@
-"""
-================================================================================
-ITI (Inference-Time Intervention) Harmfulness Steering System
-================================================================================
-
-This script implements a complete ITI pipeline for harmfulness detection and 
-steering in LLMs:
-
-1. Load model and harmfulness dataset
-2. Collect per-head activations from all layers and heads
-3. Train linear probes per head to detect harmful behavior
-4. Select top-K heads by validation accuracy
-5. Compute mean-shift steering directions (theta, sigma) per head
-6. Implement steering hooks for:
-   - Unconditional ITI (always steer)
-   - Conditional "Catch & Steer" (steer only when classifier triggers)
-
-All intermediate outputs are cached to disk for reproducibility and efficiency.
-
-Author: ITI Implementation
-Date: 2025-11-16
-================================================================================
-"""
-
 import os
 import json
 import time
@@ -34,124 +10,43 @@ import traceback
 from pathlib import Path
 from tqdm.auto import tqdm
 from typing import Dict, List, Tuple, Optional
+from util import *
 
-# HuggingFace libraries
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-# ML libraries
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import roc_auc_score, accuracy_score, classification_report
-
-# Note: Logging is now handled via command-line redirection (e.g., > run.log)
-# This avoids file locking issues and is cleaner than in-code file writing.
-
-
-# Safe print helper to avoid UnicodeEncodeError on Windows consoles
-def safe_print(s: str) -> None:
-    try:
-        print(s)
-    except UnicodeEncodeError:
-        # Fallback: write UTF-8 bytes to stdout buffer
-        try:
-            sys.stdout.buffer.write(s.encode("utf-8", errors="replace") + b"\n")
-        except Exception:
-            # Last resort: replace problematic characters
-            print(s.encode("utf-8", errors="replace").decode("utf-8"))
-
-
-# =============================================================================
-# UTILITY FUNCTIONS
-# =============================================================================
-
-def ensure_dir(path: Path) -> None:
-    """Create directory if it doesn't exist."""
-    Path(path).mkdir(parents=True, exist_ok=True)
-    print(f"[DIR] Ensured directory: {path}")
-
-
-def save_json(data: dict, filepath: Path) -> None:
-    """Save dictionary to JSON file."""
-    with open(filepath, "w") as f:
-        json.dump(data, f, indent=2)
-    print(f"[SAVE] Saved JSON: {filepath}")
-
-
-def load_json(filepath: Path) -> dict:
-    """Load dictionary from JSON file."""
-    with open(filepath, "r") as f:
-        data = json.load(f)
-    print(f"[LOAD] Loaded JSON: {filepath}")
-    return data
-
-
-def save_numpy(arr: np.ndarray, filepath: Path) -> None:
-    """Save numpy array to file."""
-    np.save(filepath, arr)
-    print(f"[SAVE] Saved numpy array: {filepath}")
-
-
-def load_numpy(filepath: Path) -> np.ndarray:
-    """Load numpy array from file."""
-    arr = np.load(filepath)
-    print(f"[LOAD] Loaded numpy array: {filepath} (shape: {arr.shape})")
-    return arr
-
-
-def save_pickle(obj, filepath: Path) -> None:
-    """Save Python object via pickle."""
-    with open(filepath, "wb") as f:
-        pickle.dump(obj, f)
-    print(f"[SAVE] Saved pickle: {filepath}")
-
-
-def load_pickle(filepath: Path):
-    """Load Python object via pickle."""
-    with open(filepath, "rb") as f:
-        obj = pickle.load(f)
-    print(f"[LOAD] Loaded pickle: {filepath}")
-    return obj
-
-
-def path_exists(filepath: Path) -> bool:
-    """Check if file/path exists."""
-    return Path(filepath).exists()
-
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 
-# Model selection
-MODEL_NAME = "distilgpt2"  # Small model for quick iteration; can switch to larger models
-CACHE_DIR = Path("./cache")  # Where to store activations, probes, and metadata
-OUTPUT_DIR = Path("./outputs")  # Where to store results and generated text
+MODEL_NAME = "Phi-3-medium-4k-instruct"
+CACHE_DIR = Path("./cache")
+OUTPUT_DIR = Path("./outputs")
 
-# Dataset and data collection
-# DATASET_NAME = "civil_comments"  # HuggingFace dataset for harmfulness detection
-DATASET_NAME = "real_toxicity_prompts"  # HuggingFace dataset for harmfulness detection
-DATASET_CONFIG = None  # No specific config for civil_comments
-DATA_SPLIT = "train[:50]"  # Use a small number for quick smoke tests
-VAL_SPLIT = "validation[:20]"  # Small validation set for smoke testing
-TEST_SPLIT = "test[:10]"  # Tiny test set
+ensure_dir(CACHE_DIR)
+ensure_dir(OUTPUT_DIR)
+print("[UTIL] Utility functions loaded.\n")
 
-# Tokenization
-BATCH_SIZE = 8  # Small batch size for quick smoke tests
+DATASET_NAME = "real-toxicity-prompts"
+TRAIN_SPLIT = "train[:8000]"
+VAL_SPLIT   = "train[8000:9000]"
+TEST_SPLIT  = "train[9000:10000]"
 
 # Probe training
-TRAIN_TEST_SPLIT = 0.8  # 80% train, 20% val within the data
-PROBE_MAX_ITER = 2000  # Max iterations for logistic regression
-PROBE_CLASS_WEIGHT = "balanced"  # Handle class imbalance
+PROBE_MAX_ITER = 2000
+PROBE_CLASS_WEIGHT = "balanced"
 
 # Head selection
-TOP_K_HEADS = 8  # Select fewer heads for quick smoke tests
+TOP_K_HEADS = 8
 
 # Steering parameters
-STEERING_ALPHA = 1.5  # Strength of steering in units of sigma
-STEERING_CATCH_THRESHOLD = 0.6  # Confidence threshold for "Catch & Steer"
+STEERING_ALPHA = 1.5
+STEERING_CATCH_THRESHOLD = 0.6
 
-# GPU/Device
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"[INIT] Using device: {device}")
 
@@ -166,7 +61,7 @@ print("SECTION 1: LOAD DATA (Harmfulness Labels)")
 print("="*80)
 
 print(f"\n>> Loading dataset: {DATASET_NAME}")
-print(f"   - Train split: {DATA_SPLIT}")
+print(f"   - Train split: {TRAIN_SPLIT}")
 print(f"   - Val split: {VAL_SPLIT}")
 
 # Cache dataset to disk
@@ -193,8 +88,7 @@ else:
     # Load training data. Try a few common name variants if the preferred
     # dataset id isn't available on the Hub (avoids DatasetNotFoundError).
     print("\n[DATA] Loading training dataset...")
-    dataset_candidates = [str(DATASET_NAME), "realtoxicityprompts", "RealToxicityPrompts",
-                          "unitary/RealToxicityPrompts", "civil_comments"]
+    dataset_candidates = [str(DATASET_NAME), "realtoxicityprompts", "RealToxicityPrompts"]
     ds_train = None
     actual_dataset = None
     for ds_name in dataset_candidates:
@@ -1229,7 +1123,7 @@ for prompt_idx, prompt in enumerate(test_prompts, 1):
     # 1. BASELINE GENERATION
     print("\n[BASE] Baseline (no steering):")
     with torch.no_grad():
-        enc = tokenizer(prompt, return_tensors="pt").to(device)
+        enc = tokenizer(prompt, return_tensors="pt")
         gen = model.generate(**enc, **generation_params)
         baseline_text = tokenizer.decode(gen[0], skip_special_tokens=True)
     safe_print(baseline_text)

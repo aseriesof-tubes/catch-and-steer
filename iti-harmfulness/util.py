@@ -69,7 +69,3 @@ def path_exists(filepath: Path) -> bool:
     return Path(filepath).exists()
 
 
-# Ensure output directories exist
-ensure_dir(CACHE_DIR)
-ensure_dir(OUTPUT_DIR)
-print("[UTIL] Utility functions loaded.\n")
