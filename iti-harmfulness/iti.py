@@ -29,12 +29,12 @@ OUTPUT_DIR = Path("./outputs")
 
 ensure_dir(CACHE_DIR)
 ensure_dir(OUTPUT_DIR)
-print("[UTIL] Utility functions loaded.\n")
 
-DATASET_NAME = "real-toxicity-prompts"
+DATASET_NAME = "allenai/real-toxicity-prompts"
 TRAIN_SPLIT = "train[:8000]"
 VAL_SPLIT   = "train[8000:9000]"
 TEST_SPLIT  = "train[9000:10000]"
+THRESHOLD = 0.75
 
 # Probe training
 PROBE_MAX_ITER = 2000
@@ -45,7 +45,7 @@ TOP_K_HEADS = 8
 
 # Steering parameters
 STEERING_ALPHA = 1.5
-STEERING_CATCH_THRESHOLD = 0.6
+STEERING_CATCH_THRESHOLD = 0.7
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"[INIT] Using device: {device}")
@@ -54,131 +54,169 @@ print(f"[INIT] Using device: {device}")
 
 
 # =============================================================================
-# SECTION 1: LOAD DATA
+# SECTION 1: LOAD DATA (HuggingFace Caches Automatically)
 # =============================================================================
-print("\n" + "="*80)
-print("SECTION 1: LOAD DATA (Harmfulness Labels)")
-print("="*80)
+# Load training data. Try a few common name variants if the preferred
+# dataset id isn't available on the Hub (avoids DatasetNotFoundError).
+print("\n[DATA] Loading training dataset...")
+ds_name = str(DATASET_NAME)
+ds = None
+try:
+    ds = load_dataset(ds_name)["train"]
+    print(f"   Loaded dataset variant: {ds_name}")
+except Exception as e:
+    print(f"   Dataset variant '{ds_name}' not available: {e}")
 
-print(f"\n>> Loading dataset: {DATASET_NAME}")
-print(f"   - Train split: {TRAIN_SPLIT}")
-print(f"   - Val split: {VAL_SPLIT}")
+#Flatten and Clean Data
 
-# Cache dataset to disk
-_ds_safe = str(DATASET_NAME).replace('/', '_').replace(':','_')
-DATA_CACHE_TRAIN = CACHE_DIR / f"{_ds_safe}_dataset_train.pkl"
-DATA_CACHE_VAL = CACHE_DIR / f"{_ds_safe}_dataset_val.pkl"
-DATA_CACHE_TEST = CACHE_DIR / f"{_ds_safe}_dataset_test.pkl"
-LABELS_CACHE_TRAIN = CACHE_DIR / f"{_ds_safe}_labels_train.npy"
-LABELS_CACHE_VAL = CACHE_DIR / f"{_ds_safe}_labels_val.npy"
-LABELS_CACHE_TEST = CACHE_DIR / f"{_ds_safe}_labels_test.npy"
+ds = ds.remove_columns(["filename", "begin", "end"])
+
+def flatten_column(example, fields):
+    for field in fields:
+        for key, val in example[field].items():
+            example[f"{field}_{key}"] = val
+        del example[field]
+    return example
+
+# Apply row-wise flattening
+ds = ds.map(lambda ex: flatten_column(ex, ["prompt", "continuation"]))
 
 
-#LOAD TRAIN AND VAL
-if path_exists(DATA_CACHE_TRAIN) and path_exists(DATA_CACHE_VAL):
-    print("\n>> Using cached dataset")
-    texts_train = load_pickle(DATA_CACHE_TRAIN)
-    texts_val = load_pickle(DATA_CACHE_VAL)
-    labels_train = load_numpy(LABELS_CACHE_TRAIN)
-    labels_val = load_numpy(LABELS_CACHE_VAL)
-    
+#Seperate Data
+
+ds_challenging = ds.filter(lambda x: x["challenging"] == True)
+ds             = ds.filter(lambda x: x["challenging"] == False)
+
+ds_challenging = ds_challenging.remove_columns(["challenging"])
+ds             = ds.remove_columns(["challenging"])
+
+# split = ds.train_test_split(test_size=0.2, shuffle=True, seed=42)
+# d_train = split["train"]
+# d_test = split["test"]
+d_train = ds.select(range(0, 800))
+d_test = ds.select(range(800, 1000))
+
+print(d_train[0])
+
+
+thresholds = {
+    "continuation_toxicity": 0.3,
+    "continuation_identity_attack": 0.3,
+    "continuation_threat": 0.45,
+    "continuation_insult": 0.3,
+    "continuation_severe_toxicity": 0.25
+}
+
+def find_threshold(ds, col, low=0.1, high=0.7, step=0.15):
+    """
+    Search for a threshold between low and high that looks like
+    it separates harmful vs. harmless examples.
+    Prints example rows near each candidate threshold.
+    """
+    values = np.array([0.0 if v is None else v for v in ds[col]], dtype=float)
+
+    thresh = low
+    while thresh <= high:
+        # Find rows closest to this threshold
+        closest_idx = np.argmin(np.abs(values - thresh))
+        print(f"\n--- {col} threshold candidate: {thresh:.3f} ---")
+        print(f"Score at closest row: {values[closest_idx]:.3f}")
+        print(ds[closest_idx])
+        thresh += step
+
+# Example usage:
+for i in thresholds.keys():
+    find_threshold(ds, i, low=0.1, high=0.3, step=0.02)
+
+
+
+def apply_thresholds(example):
+    for col, thresh in thresholds.items():
+        example[f"{col}_label"] = 1 if example[col] > thresh else 0
+    return example
+
+# Apply to both challenging and non-challenging datasets
+ds_challenging = ds_challenging.map(apply_thresholds)
+ds_nonchallenging = ds.map(apply_thresholds)
+
+
+
+
+
+exit()
+
+text_field_candidates = ["text", "prompt", "sentence", "content", "text_a", "comment_text"]
+label_field_candidates = ["toxicity", "label", "toxicity_score", "target", "y"]
+text_field = next((c for c in text_field_candidates if c in cols), cols[0])
+label_field = next((c for c in label_field_candidates if c in cols), None)
+
+print(f"   [DEBUG] Selected text field: '{text_field}'")
+print(f"   [DEBUG] Selected label field: '{label_field}'")
+
+texts_train = ds_train[text_field]
+if label_field is None:
+    print(f"[DATA] WARNING: could not find label field in dataset columns {cols}; defaulting to zeros")
+    labels_train = np.zeros(len(texts_train), dtype=np.int32)
 else:
-    print("\n>> Downloading fresh dataset (this may take a minute)...")
+    raw = np.array(ds_train[label_field])
+    print(f"   [DEBUG] Raw label field '{label_field}':")
+    print(f"      dtype: {raw.dtype}")
+    print(f"      shape: {raw.shape}")
+    print(f"      min: {raw.min()}, max: {raw.max()}, mean: {raw.mean()}")
+    print(f"      first 10 raw values: {raw[:10]}")
     
-    # Load training data. Try a few common name variants if the preferred
-    # dataset id isn't available on the Hub (avoids DatasetNotFoundError).
-    print("\n[DATA] Loading training dataset...")
-    dataset_candidates = [str(DATASET_NAME), "realtoxicityprompts", "RealToxicityPrompts"]
-    ds_train = None
-    actual_dataset = None
-    for ds_name in dataset_candidates:
-        try:
-            ds_train = load_dataset(ds_name, DATASET_CONFIG, split=DATA_SPLIT)
-            actual_dataset = ds_name
-            print(f"   Loaded dataset variant: {ds_name}")
-            break
-        except Exception as e:
-            print(f"   Dataset variant '{ds_name}' not available: {e}")
-            ds_train = None
-            continue
-    if ds_train is None:
-        raise RuntimeError(f"None of the dataset candidates could be loaded: {dataset_candidates}")
-    # Determine text and label fields defensively
-    cols = ds_train.column_names
-    print(f"   [DEBUG] Dataset columns available: {cols}")
-    
-    text_field_candidates = ["text", "prompt", "sentence", "content", "text_a", "comment_text"]
-    label_field_candidates = ["toxicity", "label", "toxicity_score", "target", "y"]
-    text_field = next((c for c in text_field_candidates if c in cols), cols[0])
-    label_field = next((c for c in label_field_candidates if c in cols), None)
-    
-    print(f"   [DEBUG] Selected text field: '{text_field}'")
-    print(f"   [DEBUG] Selected label field: '{label_field}'")
-
-    texts_train = ds_train[text_field]
-    if label_field is None:
-        print(f"[DATA] WARNING: could not find label field in dataset columns {cols}; defaulting to zeros")
-        labels_train = np.zeros(len(texts_train), dtype=np.int32)
+    if raw.dtype.kind in 'f':
+        labels_train = (raw > 0.5).astype(np.int32)
+        print(f"   [DEBUG] Converted float labels (threshold 0.5)")
     else:
-        raw = np.array(ds_train[label_field])
-        print(f"   [DEBUG] Raw label field '{label_field}':")
-        print(f"      dtype: {raw.dtype}")
-        print(f"      shape: {raw.shape}")
-        print(f"      min: {raw.min()}, max: {raw.max()}, mean: {raw.mean()}")
-        print(f"      first 10 raw values: {raw[:10]}")
-        
-        if raw.dtype.kind in 'f':
-            labels_train = (raw > 0.5).astype(np.int32)
-            print(f"   [DEBUG] Converted float labels (threshold 0.5)")
-        else:
-            labels_train = raw.astype(np.int32)
-            print(f"   [DEBUG] Converted int labels directly")
+        labels_train = raw.astype(np.int32)
+        print(f"   [DEBUG] Converted int labels directly")
 
-    print(f"   Train examples: {len(texts_train)}")
-    try:
-        dist = np.bincount(labels_train)
-        print(f"   Label distribution: {dist}")
-        print(f"   Label percentages: class_0={100*dist[0]/len(labels_train):.1f}%, class_1={100*dist[1]/len(labels_train) if len(dist) > 1 else 0:.1f}%")
-    except Exception as e:
-        print(f"   Could not compute label distribution: {e}")
+print(f"   Train examples: {len(texts_train)}")
+try:
+    dist = np.bincount(labels_train)
+    print(f"   Label distribution: {dist}")
+    print(f"   Label percentages: class_0={100*dist[0]/len(labels_train):.1f}%, class_1={100*dist[1]/len(labels_train) if len(dist) > 1 else 0:.1f}%")
+except Exception as e:
+    print(f"   Could not compute label distribution: {e}")
 
-    # Load validation data (use the actual dataset id that loaded above)
-    print("\n[DATA] Loading validation dataset...")
-    if actual_dataset is None:
-        actual_dataset = DATASET_NAME
-    ds_val = load_dataset(actual_dataset, DATASET_CONFIG, split=VAL_SPLIT)
-    texts_val = ds_val[text_field]
-    if label_field is None:
-        labels_val = np.zeros(len(texts_val), dtype=np.int32)
-    else:
-        rawv = np.array(ds_val[label_field])
-        print(f"   [DEBUG] Raw VAL label field '{label_field}':")
-        print(f"      dtype: {rawv.dtype}")
-        print(f"      shape: {rawv.shape}")
-        print(f"      min: {rawv.min()}, max: {rawv.max()}, mean: {rawv.mean()}")
-        print(f"      first 10 raw values: {rawv[:10]}")
-        
-        if rawv.dtype.kind in 'f':
-            labels_val = (rawv > 0.5).astype(np.int32)
-            print(f"   [DEBUG] Converted float labels (threshold 0.5)")
-        else:
-            labels_val = rawv.astype(np.int32)
-            print(f"   [DEBUG] Converted int labels directly")
-            
-    print(f"   Val examples: {len(texts_val)}")
-    try:
-        dist = np.bincount(labels_val)
-        print(f"   Label distribution: {dist}")
-        print(f"   Label percentages: class_0={100*dist[0]/len(labels_val):.1f}%, class_1={100*dist[1]/len(labels_val) if len(dist) > 1 else 0:.1f}%")
-    except Exception as e:
-        print(f"   Could not compute label distribution: {e}")
+# Load validation data (use the actual dataset id that loaded above)
+print("\n[DATA] Loading validation dataset...")
+if actual_dataset is None:
+    actual_dataset = DATASET_NAME
+ds_val = load_dataset(actual_dataset, DATASET_CONFIG, split=VAL_SPLIT)
+texts_val = ds_val[text_field]
+if label_field is None:
+    labels_val = np.zeros(len(texts_val), dtype=np.int32)
+else:
+    rawv = np.array(ds_val[label_field])
+    print(f"   [DEBUG] Raw VAL label field '{label_field}':")
+    print(f"      dtype: {rawv.dtype}")
+    print(f"      shape: {rawv.shape}")
+    print(f"      min: {rawv.min()}, max: {rawv.max()}, mean: {rawv.mean()}")
+    print(f"      first 10 raw values: {rawv[:10]}")
     
-    # Cache to disk for next run
-    save_pickle(texts_train, DATA_CACHE_TRAIN)
-    save_pickle(texts_val, DATA_CACHE_VAL)
-    save_numpy(labels_train, LABELS_CACHE_TRAIN)
-    save_numpy(labels_val, LABELS_CACHE_VAL)
-    print("\n[DATA] Dataset cached to disk for next run")
+    if rawv.dtype.kind in 'f':
+        labels_val = (rawv > 0.5).astype(np.int32)
+        print(f"   [DEBUG] Converted float labels (threshold 0.5)")
+    else:
+        labels_val = rawv.astype(np.int32)
+        print(f"   [DEBUG] Converted int labels directly")
+        
+print(f"   Val examples: {len(texts_val)}")
+try:
+    dist = np.bincount(labels_val)
+    print(f"   Label distribution: {dist}")
+    print(f"   Label percentages: class_0={100*dist[0]/len(labels_val):.1f}%, class_1={100*dist[1]/len(labels_val) if len(dist) > 1 else 0:.1f}%")
+except Exception as e:
+    print(f"   Could not compute label distribution: {e}")
+
+# Cache to disk for next run
+save_pickle(texts_train, DATA_CACHE_TRAIN)
+save_pickle(texts_val, DATA_CACHE_VAL)
+save_numpy(labels_train, LABELS_CACHE_TRAIN)
+save_numpy(labels_val, LABELS_CACHE_VAL)
+print("\n[DATA] Dataset cached to disk for next run")
 
 # Store in dict for easy access
 data = {
