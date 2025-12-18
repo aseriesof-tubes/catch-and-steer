@@ -218,3 +218,4 @@ uv.lock
 unsloth_compiled_cache/
 pyproject.toml
 .python-version
+submit_slurm.py

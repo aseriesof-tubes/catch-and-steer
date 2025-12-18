@@ -1,0 +1,140 @@
+{
+    "model": {
+        "model_name": "unsloth/Phi-3.5-mini-instruct",
+        "max_seq_length": 8192,
+        "load_in_4bit": true
+    },
+    "vectors": [
+        {
+            "name": "harmful",
+            "base": {
+                "type": "parquet",
+                "path": "hf://datasets/tatsu-lab/alpaca/data/train-00000-of-00001-a09b74b3ef9c3b56.parquet",
+                "column": "instruction",
+                "slice": [
+                    0,
+                    200
+                ]
+            },
+            "target": {
+                "type": "csv",
+                "path": "/nfshomes/dkim5124/Documents/catch-and-steer/data/harmful_behaviors.csv",
+                "column": "goal",
+                "slice": [
+                    0,
+                    200
+                ]
+            }
+        },
+        {
+            "name": "love_hate",
+            "base": {
+                "type": "inline",
+                "texts": [
+                    "hate",
+                    "i hate this",
+                    "hating the",
+                    "hater",
+                    "hating",
+                    "hated in"
+                ]
+            },
+            "target": {
+                "type": "inline",
+                "texts": [
+                    "love",
+                    "i love this",
+                    "loving the",
+                    "lover",
+                    "loving",
+                    "loved in"
+                ]
+            }
+        },
+        {
+            "name": "honest_dishonest",
+            "base": {
+                "type": "inline",
+                "texts": [
+                    "untrustworthy",
+                    "insincere",
+                    "fake",
+                    "dishonesty",
+                    "deceit",
+                    "deception",
+                    "devious",
+                    "lie"
+                ]
+            },
+            "target": {
+                "type": "inline",
+                "texts": [
+                    "honest",
+                    "truthful",
+                    "sincere",
+                    "integrity",
+                    "honesty",
+                    "truth",
+                    "candor",
+                    "transparent",
+                    "straightforward"
+                ]
+            }
+        },
+        {
+            "name": "boat_no_boat",
+            "base": {
+                "type": "inline",
+                "texts": [
+                    "boat",
+                    "ship",
+                    "sail",
+                    "sailing",
+                    "boat-like", "ship-like"
+                ]
+            },
+            "target": {
+                "type": "inline",
+                "texts": [
+                    "car",
+                    "truck",
+                    "driving"
+                ]
+            }
+        },
+        {
+            "name": "positive_negative",
+            "base": {
+                "type": "inline",
+                "texts": [
+                    "negative",
+                    "terrible",
+                    "awful",
+                    "horrible",
+                    "dreadful", "poor"
+                ]
+            },
+            "target": {
+                "type": "inline",
+                "texts": [
+                    "positive",
+                    "amazing",
+                    "wonderful", "fantastic", "brilliant", "excellent"
+                ]
+            }
+        }
+    ],
+    "tests": [
+        {
+            "name": "harmful_prompts_10",
+            "prompts": {
+                "type": "csv",
+                "path": "/nfshomes/dkim5124/Documents/catch-and-steer/data/harmful_behaviors.csv",
+                "column": "goal",
+                "slice": [
+                    67,77
+                ]
+            }
+        }
+    ]
+}
