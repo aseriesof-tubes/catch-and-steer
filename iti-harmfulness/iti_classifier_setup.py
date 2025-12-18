@@ -36,14 +36,7 @@ for col in ds.column_names:
         print(f"{col:35s} {count:6d} / {len(ds)}  ({pct:5.2f}%)")
 
 
-print(f"[TIMER] step_name: {time.time() - start:.2f}s", flush=True)
-
-
-TRAIN_SPLIT = "train[:8000]"
-VAL_SPLIT   = "train[8000:9000]"
-TEST_SPLIT  = "train[9000:10000]"
-
-exit()
+print(f"Data Loaded: {time.time() - start:.2f}s", flush=True)
 
 
 # ====================================================================
@@ -60,9 +53,6 @@ from typing import Dict, List, Tuple, Optional
 TRAIN_SPLIT = "train[:8000]"
 VAL_SPLIT   = "train[8000:9000]"
 TEST_SPLIT  = "train[9000:10000]"
-THRESHOLD = 0.75
-
-MODEL_NAME = "meta-llama/Meta-Llama-3-8B"
 
 # Probe training
 PROBE_MAX_ITER = 2000
@@ -76,40 +66,23 @@ STEERING_ALPHA = 1.5
 STEERING_CATCH_THRESHOLD = 0.7
 
 
-text_field_candidates = ["text", "prompt", "sentence", "content", "text_a", "comment_text"]
-label_field_candidates = ["toxicity", "label", "toxicity_score", "target", "y"]
-text_field = next((c for c in text_field_candidates if c in cols), cols[0])
-label_field = next((c for c in label_field_candidates if c in cols), None)
-
-print(f"   [DEBUG] Selected text field: '{text_field}'")
-print(f"   [DEBUG] Selected label field: '{label_field}'")
-
 # =============================================================================
 # SECTION 2: LOAD MODEL AND TOKENIZER
 # =============================================================================
-print("\n" + "="*80)
-print("SECTION 2: LOAD MODEL AND TOKENIZER")
-print("="*80)
 
-print(f"\n>> Loading model: {MODEL_NAME}")
-print("   Note: Unsloth integration for faster inference (commented out for now)")
-print("   Currently using standard transformers loading.")
+MODEL_NAME = "meta-llama/Meta-Llama-3-8B"
 
-# Initialize tokenizer
-print("\n[MODEL] Initializing tokenizer...")
+
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
     print(f"   Set pad_token to eos_token: {tokenizer.eos_token}")
 
-# Load model with hidden states
-print("[MODEL] Loading causal LM with hidden states...")
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
-    output_hidden_states=True  # CRITICAL: Need this to extract head activations
+    output_hidden_states=True
 ).to(device).eval()
 
-# Print model architecture info
 print(f"\n[MODEL] Model info:")
 print(f"   Model name: {MODEL_NAME}")
 print(f"   Device: {device}")
@@ -117,6 +90,7 @@ print(f"   Num layers: {model.config.num_hidden_layers}")
 print(f"   Num heads: {model.config.num_attention_heads}")
 print(f"   Hidden size: {model.config.hidden_size}")
 print(f"   Head size: {model.config.hidden_size // model.config.num_attention_heads}")
+
 
 # Freeze model (we won't be updating weights)
 for param in model.parameters():
@@ -131,11 +105,6 @@ if torch.cuda.is_available():
 
 # =============================================================================
 # SECTION 3: COLLECT HEAD ACTIVATIONS
-# =============================================================================
-print("\n" + "="*80)
-print("SECTION 3: COLLECT HEAD ACTIVATIONS")
-print("="*80)
-
 """
 In this section, we extract activations from EACH ATTENTION HEAD at EACH LAYER
 for all training and validation examples.
@@ -146,83 +115,202 @@ For each example:
   - Extract activations for each head
   - Store activations per head
 
-Output structure:
-  activations_train[layer][head] -> np.ndarray of shape (num_examples, hidden_size_per_head)
-  activations_val[layer][head]   -> np.ndarray of shape (num_examples, hidden_size_per_head)
+Then we can:
+    - take head activations + label per example
+    - train classifiers on all (per category)
+    
+And later this can:
+    - choose positive activations and negative activations
+    - create contrastive pair steering vectors based on means of positive activations and negative activations in a specific head
 """
 
-ACTS_CACHE_TRAIN = CACHE_DIR / "activations_train.pkl"
-ACTS_CACHE_VAL = CACHE_DIR / "activations_val.pkl"
+import os
+import json
+import numpy as np
+import torch
+import pandas as pd
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
 
-@torch.no_grad()
-def collect_head_activations(texts, labels, batch_size=BATCH_SIZE):
+def collect_all_head_last_token_acts_cached(
+    ds,
+    model,
+    tokenizer,
+    label_cols: List[str],
+    cache_dir: Path,
+    cache_name: str,
+    batch_size: int = 8,
+    max_length: int = 4096,
+    device: str = "cuda",
+    use_continuation: bool = True,
+    return_float16: bool = True,
+    verbose_every: int = 50,
+    debug: bool = True,
+) -> Tuple[np.ndarray, Dict[str, np.ndarray], pd.DataFrame]:
     """
-    Collect per-head activations by capturing the attention-module outputs
-    via temporary forward hooks. This ensures activations come from the
-    same tensor that steering hooks will modify.
-
-    Only extracts the LAST TOKEN activation from each example.
-
-    Returns:
-        activations_per_head: Dict[layer][head] -> np.ndarray (N, head_dim)
+    Cached wrapper: stores and reloads:
+      - X.npy  : (N, L, H, D) activations
+      - labels.npz : each label array
+      - stats.csv : label prevalence table
+      - meta.json : metadata to sanity-check cache compatibility
     """
+
+    cache_dir = Path(cache_dir)
+    out_dir = cache_dir / cache_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    x_path = out_dir / "X.npy"
+    y_path = out_dir / "labels.npz"
+    s_path = out_dir / "stats.csv"
+    m_path = out_dir / "meta.json"
+
+    # ---- If cached, load and return ----
+    if x_path.exists() and y_path.exists() and s_path.exists() and m_path.exists():
+        if debug:
+            print(f"[CACHE] Loading cached activations from: {out_dir}")
+
+        X = np.load(x_path, mmap_mode=None)  # set mmap_mode="r" if you want lazy loading
+        y_npz = np.load(y_path)
+        Y = {k: y_npz[k] for k in y_npz.files}
+        stats_df = pd.read_csv(s_path)
+
+        if debug:
+            print(f"[CACHE] Loaded X shape: {X.shape}, dtype={X.dtype}")
+            print(f"[CACHE] Loaded labels: {list(Y.keys())}")
+            print(f"[CACHE] Stats preview:\n{stats_df.head(10)}")
+
+        return X, Y, stats_df
+
+    # ---- Otherwise compute ----
+    assert "prompt_text" in ds.column_names, "ds must contain prompt_text"
+    if use_continuation:
+        assert "continuation_text" in ds.column_names, "ds must contain continuation_text if use_continuation=True"
+    for c in label_cols:
+        assert c in ds.column_names, f"missing label col: {c}"
+
+    # Model dims
     num_layers = model.config.num_hidden_layers
-    num_heads = model.config.num_attention_heads
-    head_dim = model.config.hidden_size // num_heads
+    num_heads  = model.config.num_attention_heads
+    hidden     = model.config.hidden_size
+    head_dim   = hidden // num_heads
+    N = len(ds)
 
-    # Storage for activations collected via hooks
-    activations_per_head = {}
-    for layer in range(num_layers):
-        activations_per_head[layer] = {}
-        for head in range(num_heads):
-            activations_per_head[layer][head] = []
+    dtype_np = np.float16 if return_float16 else np.float32
 
-    # Hook callback factory: captures the attention module's output
-    # and appends per-head last-token activations to our storage.
+    # Labels dict
+    Y: Dict[str, np.ndarray] = {}
+    for c in label_cols:
+        Y[c] = np.asarray(ds[c], dtype=np.int64)
+
+    # Stats dataframe (your “big chart”)
+    rows = []
+    for c in label_cols:
+        pos = int(Y[c].sum())
+        rows.append({
+            "label": c,
+            "positives": pos,
+            "total": N,
+            "pct_positive": 100.0 * pos / max(1, N),
+        })
+    stats_df = pd.DataFrame(rows).sort_values("pct_positive", ascending=False).reset_index(drop=True)
+
+    # Allocate activation tensor (CPU)
+    X = np.empty((N, num_layers, num_heads, head_dim), dtype=dtype_np)
+
+    # Hook cache: layer_idx -> tensor [B, T, hidden]
+    hook_cache: Dict[int, torch.Tensor] = {}
     hooks = []
 
-    def make_capture_hook(layer_idx):
-        def _hook(module, input, output):
-            # output may be tensor or tuple
-            if isinstance(output, tuple):
-                attn_out = output[0]
-            else:
-                attn_out = output
+    layers = model.model.layers  # HF Llama style
 
-            # attn_out: (batch_size, seq_len, hidden_size)
-            bsz, seq_len, hidden_size = attn_out.shape
-            # reshape to (batch, seq_len, num_heads, head_dim)
-            out_resh = attn_out.reshape(bsz, seq_len, num_heads, head_dim)
-            # take last token per example
-            last_token = out_resh[:, -1, :, :].cpu().numpy()  # shape: (bsz, num_heads, head_dim)
+    def make_o_proj_hook(layer_idx: int):
+        def hook(module, inputs, output):
+            # inputs[0] is the tensor fed into o_proj: [B, T, hidden] = concat(head outputs)
+            hook_cache[layer_idx] = inputs[0]
+        return hook
 
-            # Append per-head
-            for h in range(num_heads):
-                activations_per_head[layer_idx][h].append(last_token[:, h, :])
+    for layer_idx, layer in enumerate(layers):
+        hooks.append(layer.self_attn.o_proj.register_forward_hook(make_o_proj_hook(layer_idx)))
 
-        return _hook
+    # tokenizer pad token for batching
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-    # Register hooks on each attention layer
-    for layer_idx in range(num_layers):
-        attn_layer = model.transformer.h[layer_idx].attn
-        hook_fn = make_capture_hook(layer_idx)
-        hooks.append(attn_layer.register_forward_hook(hook_fn))
+    def build_text(i: int) -> str:
+        if use_continuation:
+            return ds["prompt_text"][i] + ds["continuation_text"][i]
+        else:
+            return ds["prompt_text"][i]
 
-    # Process in batches and run forward passes (hooks collect activations)
-    num_batches = (len(texts) + batch_size - 1) // batch_size
-    pbar = tqdm(total=num_batches, desc="Collecting activations (hooks)")
+    # Debug: show one raw example
+    if debug:
+        print("\n[DEBUG] Example row (text + a few labels):")
+        ex0 = {
+            "prompt_text": ds["prompt_text"][0][:120],
+            "continuation_text": (ds["continuation_text"][0][:120] if use_continuation else ""),
+        }
+        for c in label_cols[:3]:
+            ex0[c] = int(ds[c][0])
+        print(ex0)
 
-    for batch_idx in range(num_batches):
-        start_idx = batch_idx * batch_size
-        end_idx = min(start_idx + batch_size, len(texts))
-        batch_texts = list(texts[start_idx:end_idx])
+        print("\n[DEBUG] Label chart preview:")
+        print(stats_df.head(10))
 
-        enc = tokenizer(batch_texts, return_tensors="pt", padding=True).to(device)
-        _ = model(**enc)
+        print(f"\n[DEBUG] Will produce X with shape (N={N}, L={num_layers}, H={num_heads}, D={head_dim}), dtype={dtype_np}")
 
-        pbar.update(1)
+    model.eval()
 
-    pbar.close()
+    with torch.inference_mode():
+        num_batches = (N + batch_size - 1) // batch_size
+        for b in range(num_batches):
+            start = b * batch_size
+            end   = min(start + batch_size, N)
+            bsz   = end - start
+
+            batch_texts = [build_text(i) for i in range(start, end)]
+
+            enc = tokenizer(
+                batch_texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=max_length,
+            )
+            input_ids = enc["input_ids"].to(device)
+            attention_mask = enc["attention_mask"].to(device)
+
+            # forward pass triggers hooks
+            _ = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+
+            # last real token index per example (handles padding)
+            last_idx = torch.clamp(attention_mask.sum(dim=1) - 1, min=0)  # [B]
+
+            # For each layer: [B,T,hidden] -> [B,T,H,D] -> gather last token -> [B,H,D]
+            for layer_idx in range(num_layers):
+                x_in = hook_cache[layer_idx]  # [B,T,hidden]
+                x_heads = x_in.view(bsz, x_in.size(1), num_heads, head_dim)  # [B,T,H,D]
+
+                idx = last_idx.view(bsz, 1, 1, 1).expand(bsz, 1, num_heads, head_dim)
+                picked = x_heads.gather(dim=1, index=idx).squeeze(1)  # [B,H,D]
+
+                picked_cpu = picked.detach().to("cpu")
+                picked_cpu = picked_cpu.to(torch.float16 if return_float16 else torch.float32)
+
+                X[start:end, layer_idx, :, :] = picked_cpu.numpy().astype(dtype_np, copy=False)
+
+            # Debug: sanity-check shapes on first batch
+            if debug and b == 0:
+                any_layer = 0
+                x0 = hook_cache[any_layer]
+                print("\n[DEBUG] Hook sanity check (first batch):")
+                print(f"  hook_cache[layer=0] shape: {tuple(x0.shape)}  (should be [B,T,hidden])")
+                print(f"  last_idx[:min(5,B)]: {last_idx[:min(5, bsz)].tolist()}")
+                print(f"  stored X[0] slice shape: {X[0].shape}  (should be [L,H,D])")
+                print(f"  stored X[0,0] shape: {X[0,0].shape}  (should be [H,D])")
+                print(f"  stored X[0,0,0] shape: {X[0,0,0].shape}  (should be [D])")
+
+            if verbose_every and ((b + 1) % verbose_every == 0 or b == num_batches - 1):
+                print(f"[ACTS] batch {b+1}/{num_batches} done (rows {start}:{end})")
 
     # Remove hooks
     for h in hooks:
@@ -231,46 +319,57 @@ def collect_head_activations(texts, labels, batch_size=BATCH_SIZE):
         except Exception:
             pass
 
-    # Concatenate batches per head
-    print("   Concatenating batches (hook-collected)...")
-    for layer in range(num_layers):
-        for head in range(num_heads):
-            if len(activations_per_head[layer][head]) == 0:
-                activations_per_head[layer][head] = np.zeros((0, head_dim), dtype=np.float32)
-            else:
-                activations_per_head[layer][head] = np.concatenate(
-                    activations_per_head[layer][head], axis=0
-                )
+    # ---- Save cache to disk ----
+    if debug:
+        print(f"\n[CACHE] Saving outputs to: {out_dir}")
 
-    return activations_per_head
+    np.save(x_path, X)  # saves as .npy
+    np.savez_compressed(y_path, **Y)
+    stats_df.to_csv(s_path, index=False)
+
+    meta = {
+        "N": N,
+        "num_layers": num_layers,
+        "num_heads": num_heads,
+        "hidden_size": hidden,
+        "head_dim": head_dim,
+        "dtype": str(X.dtype),
+        "label_cols": label_cols,
+        "use_continuation": use_continuation,
+        "max_length": max_length,
+        "model_name": getattr(model.config, "_name_or_path", None),
+    }
+    with open(m_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+    if debug:
+        print(f"[CACHE] Done. X shape={X.shape}, labels={list(Y.keys())}")
+
+    return X, Y, stats_df
 
 
-if path_exists(ACTS_CACHE_TRAIN) and path_exists(ACTS_CACHE_VAL):
-    print("\n>> Using cached activations (already collected)")
-    activations_train = load_pickle(ACTS_CACHE_TRAIN)
-    activations_val = load_pickle(ACTS_CACHE_VAL)
-    
-else:
-    print("\n>> Collecting fresh activations from model")
-    print("   (This will take a few minutes on first run...)")
-    
-    # Collect for train and val using the function defined above
-    print("\n[ACTS] Collecting TRAINING activations...")
-    activations_train = collect_head_activations(texts_train, labels_train)
-    
-    print("\n[ACTS] Collecting VALIDATION activations...")
-    activations_val = collect_head_activations(texts_val, labels_val)
-    
-    # Cache to disk
-    save_pickle(activations_train, ACTS_CACHE_TRAIN)
-    save_pickle(activations_val, ACTS_CACHE_VAL)
-    print("\n[ACTS] Activations cached.")
+label_cols = [
+    "continuation_toxicity_label",
+    "continuation_identity_attack_label",
+    "continuation_threat_label",
+    "continuation_insult_label",
+    "continuation_profanity_label",
+    "continuation_sexually_explicit_label",
+    "continuation_severe_toxicity_label",
+]
 
-print("\n[ACTS] Head activations ready.")
-print(f"   Num layers: {len(activations_train)}")
-print(f"   Num heads per layer: {len(activations_train[0])}")
-print(f"   Example activation shape: {activations_train[0][0].shape}")
-print()
+X, Y, stats = collect_all_head_last_token_acts(
+    ds=ds,
+    model=model,
+    tokenizer=tokenizer,
+    label_cols=label_cols,
+    batch_size=8,
+    max_length=2048,  # you can lower for speed
+    device=device,
+    use_continuation=True,
+)
+
+print(stats)
 
 
 # =============================================================================
