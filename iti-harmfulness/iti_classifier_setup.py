@@ -2,17 +2,18 @@ import time
 
 start = time.time()
 
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"[INIT] Using device: {device}")
 
-from pathlib import Path
-from typing import Dict, List, Tuple, Optional
-from util import *
+
+# =================================================
+# LOAD TRAINING DATA
 
 from datasets import load_from_disk
-from transformers import AutoTokenizer, AutoModelForCausalLM
 
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import roc_auc_score, accuracy_score, classification_report
+from pathlib import Path
+from util import *
+
 
 
 MODEL_NAME = "meta-llama/Meta-Llama-3-8B"
@@ -26,16 +27,36 @@ CLASSIFIER_TRAINING_DATA_PATH = CACHE_DIR / "classifier_training_data"
 ds = load_from_disk(str(CLASSIFIER_TRAINING_DATA_PATH))
 
 
-print(ds[0], ds[1], ds[2])
+
+print("\n[STATS] Label prevalence:")
+for col in ds.column_names:
+    if col.endswith("_label"):
+        count = sum(ds[col])
+        pct = 100 * count / len(ds)
+        print(f"{col:35s} {count:6d} / {len(ds)}  ({pct:5.2f}%)")
+
+
 print(f"[TIMER] step_name: {time.time() - start:.2f}s", flush=True)
 
+
+TRAIN_SPLIT = "train[:8000]"
+VAL_SPLIT   = "train[8000:9000]"
+TEST_SPLIT  = "train[9000:10000]"
 
 exit()
 
 
-# =====================================================================
+# ====================================================================
 
-DATASET_NAME = "allenai/real-toxicity-prompts"
+
+# =====================================================================
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import roc_auc_score, accuracy_score, classification_report
+from typing import Dict, List, Tuple, Optional
+
 TRAIN_SPLIT = "train[:8000]"
 VAL_SPLIT   = "train[8000:9000]"
 TEST_SPLIT  = "train[9000:10000]"
@@ -62,123 +83,6 @@ label_field = next((c for c in label_field_candidates if c in cols), None)
 
 print(f"   [DEBUG] Selected text field: '{text_field}'")
 print(f"   [DEBUG] Selected label field: '{label_field}'")
-
-texts_train = ds_train[text_field]
-if label_field is None:
-    print(f"[DATA] WARNING: could not find label field in dataset columns {cols}; defaulting to zeros")
-    labels_train = np.zeros(len(texts_train), dtype=np.int32)
-else:
-    raw = np.array(ds_train[label_field])
-    print(f"   [DEBUG] Raw label field '{label_field}':")
-    print(f"      dtype: {raw.dtype}")
-    print(f"      shape: {raw.shape}")
-    print(f"      min: {raw.min()}, max: {raw.max()}, mean: {raw.mean()}")
-    print(f"      first 10 raw values: {raw[:10]}")
-    
-    if raw.dtype.kind in 'f':
-        labels_train = (raw > 0.5).astype(np.int32)
-        print(f"   [DEBUG] Converted float labels (threshold 0.5)")
-    else:
-        labels_train = raw.astype(np.int32)
-        print(f"   [DEBUG] Converted int labels directly")
-
-print(f"   Train examples: {len(texts_train)}")
-try:
-    dist = np.bincount(labels_train)
-    print(f"   Label distribution: {dist}")
-    print(f"   Label percentages: class_0={100*dist[0]/len(labels_train):.1f}%, class_1={100*dist[1]/len(labels_train) if len(dist) > 1 else 0:.1f}%")
-except Exception as e:
-    print(f"   Could not compute label distribution: {e}")
-
-# Load validation data (use the actual dataset id that loaded above)
-print("\n[DATA] Loading validation dataset...")
-if actual_dataset is None:
-    actual_dataset = DATASET_NAME
-ds_val = load_dataset(actual_dataset, DATASET_CONFIG, split=VAL_SPLIT)
-texts_val = ds_val[text_field]
-if label_field is None:
-    labels_val = np.zeros(len(texts_val), dtype=np.int32)
-else:
-    rawv = np.array(ds_val[label_field])
-    print(f"   [DEBUG] Raw VAL label field '{label_field}':")
-    print(f"      dtype: {rawv.dtype}")
-    print(f"      shape: {rawv.shape}")
-    print(f"      min: {rawv.min()}, max: {rawv.max()}, mean: {rawv.mean()}")
-    print(f"      first 10 raw values: {rawv[:10]}")
-    
-    if rawv.dtype.kind in 'f':
-        labels_val = (rawv > 0.5).astype(np.int32)
-        print(f"   [DEBUG] Converted float labels (threshold 0.5)")
-    else:
-        labels_val = rawv.astype(np.int32)
-        print(f"   [DEBUG] Converted int labels directly")
-        
-print(f"   Val examples: {len(texts_val)}")
-try:
-    dist = np.bincount(labels_val)
-    print(f"   Label distribution: {dist}")
-    print(f"   Label percentages: class_0={100*dist[0]/len(labels_val):.1f}%, class_1={100*dist[1]/len(labels_val) if len(dist) > 1 else 0:.1f}%")
-except Exception as e:
-    print(f"   Could not compute label distribution: {e}")
-
-# Cache to disk for next run
-save_pickle(texts_train, DATA_CACHE_TRAIN)
-save_pickle(texts_val, DATA_CACHE_VAL)
-save_numpy(labels_train, LABELS_CACHE_TRAIN)
-save_numpy(labels_val, LABELS_CACHE_VAL)
-print("\n[DATA] Dataset cached to disk for next run")
-
-# Store in dict for easy access
-data = {
-    "texts_train": texts_train,
-    "labels_train": labels_train,
-    "texts_val": texts_val,
-    "labels_val": labels_val,
-}
-
-# Attempt to load a small TEST split (if available) and print first examples
-DATA_CACHE_TEST = CACHE_DIR / "dataset_test.pkl"
-LABELS_CACHE_TEST = CACHE_DIR / "labels_test.npy"
-
-#LOAD TEST
-if path_exists(DATA_CACHE_TEST) and path_exists(LABELS_CACHE_TEST):
-    texts_test = load_pickle(DATA_CACHE_TEST)
-    labels_test = load_numpy(LABELS_CACHE_TEST)
-else:
-    try:
-        ds_test = load_dataset(actual_dataset, DATASET_CONFIG, split=TEST_SPLIT)
-        texts_test = ds_test["text"]
-        labels_test = np.array(ds_test["toxicity"], dtype=np.int32)
-        # Cache for future runs
-        save_pickle(texts_test, DATA_CACHE_TEST)
-        save_numpy(labels_test, LABELS_CACHE_TEST)
-    except Exception as e:
-        print(f"[DATA] Test split not available or failed to load: {e}")
-        texts_test = []
-        labels_test = np.array([], dtype=np.int32)
-
-data["texts_test"] = texts_test
-data["labels_test"] = labels_test
-
-def _print_samples(name, texts, labels, n=2):
-    print(f"\n[DEBUG] First {n} {name} samples (for debugging):")
-    for i in range(min(n, len(texts))):
-        # Use safe_print to avoid Windows console encoding issues
-        try:
-            safe_print(f"  #{i}: {texts[i]}")
-        except Exception:
-            print(f"  #{i}: <unprintable text>")
-        lbl = labels[i] if i < len(labels) else 'N/A'
-        print(f"    label: {lbl}")
-
-
-# Print first few samples for train/val/test to aid debugging
-_print_samples('train', texts_train, labels_train)
-_print_samples('val', texts_val, labels_val)
-_print_samples('test', texts_test, labels_test)
-
-print("\n[DATA] Dataset loaded successfully.\n")
-
 
 # =============================================================================
 # SECTION 2: LOAD MODEL AND TOKENIZER

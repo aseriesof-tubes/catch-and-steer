@@ -2,27 +2,19 @@ import time
 
 start = time.time()
 
-import numpy as np
-import torch
-import joblib
 from pathlib import Path
-from tqdm.auto import tqdm
 from typing import Dict, List, Tuple, Optional
 from util import *
 
 from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM
-
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import roc_auc_score, accuracy_score, classification_report
-from datasets import load_from_disk
 
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 
+
+DATASET_NAME = "allenai/real-toxicity-prompts"
 
 CACHE_DIR = Path("./cache")
 OUTPUT_DIR = Path("./outputs")
@@ -103,20 +95,14 @@ ds             = ds.filter(lambda x: x["challenging"] == False)
 ds_challenging = ds_challenging.remove_columns(["challenging"])
 ds             = ds.remove_columns(["challenging"])
 
-# split = ds.train_test_split(test_size=0.2, shuffle=True, seed=42)
-# d_train = split["train"]
-# d_test = split["test"]
-d_train = ds.select(range(0, 800))
-d_test = ds.select(range(800, 1000))
-
-print(d_train[0])
-
 
 thresholds = {
-    "continuation_toxicity": 0.3,
+    "continuation_toxicity": 0.4,
     "continuation_identity_attack": 0.3,
     "continuation_threat": 0.45,
     "continuation_insult": 0.3,
+    "continuation_profanity": 0.3,
+    "continuation_sexually_explicit": 0.3,
     "continuation_severe_toxicity": 0.25
 }
 
@@ -171,6 +157,12 @@ ds = ds.map(apply_thresholds_batched, batched=True)
 print(ds[0], ds[1], ds[2])
 print(f"[TIMER] step_name: {time.time() - start:.2f}s", flush=True)
 
+keep_cols = [
+    "prompt_text",
+    "continuation_text",
+] + [c for c in ds.column_names if c.endswith("_label")]
+
+ds = ds.select_columns(keep_cols)
 
 ds.save_to_disk(str(CLASSIFIER_TRAINING_DATA_PATH))
 
